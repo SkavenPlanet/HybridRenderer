@@ -1,6 +1,6 @@
 # HybridRenderer
 
-Hybrid Deferred Rendering Pipeline using Unity's SRP feature.
+Hybrid Deferred Rendering Pipeline built using Unity's SRP feature.
 
 Features:
 - Realtime Raytraced Mirror Specular & Diffuse GI (DDGI)
@@ -8,7 +8,7 @@ Features:
 - Raytraced AO
 - Voxel Light Culling
 - Sky Rendering (Precomputed Atmospheric Scattering)
-- Unified Lighting Path
+- Unified Deferred Lighting Path
 
 Video Link: https://www.youtube.com/watch?v=TXqKqrPcdZQ
 
