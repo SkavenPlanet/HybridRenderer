@@ -1,0 +1,116 @@
+#define RAYTRACE_SHADER
+
+RWTexture2D<float4> RenderTarget;
+
+uniform int _NumRaysPerProbe;
+Texture2D Albedo, SpecRough, Normal, Emission, Depth, Position, SpecularGI, PrimaryDepth, AO;
+Texture2D<uint2> Stencil;
+RaytracingAccelerationStructure accelerationStructure : register(t0);
+
+#pragma max_recursion_depth 2
+
+#include "HLSLSupport.cginc"
+#include "UnityGBuffer.cginc"
+#include "UnityShaderVariables.cginc"
+#include "Assets/Shaders/PositionFromDepth.cginc"
+#include "Assets/Shaders/Lighting.cginc"
+#include "Assets/Shaders/DDGI.cginc"
+#include "Assets/Shaders/Sky.cginc"
+
+#define SECOND_ORDER_GI_MUL 0.1
+
+float3 CalcIrradiance(int2 xy, float3 wpos, float3 vpos, bool specRef, bool diffRef, bool secondOrderGI, bool useScreenShadow)
+{
+	// unpack gbuffer
+	float4 gbuffer0 = Albedo[xy];
+	float4 gbuffer1 = SpecRough[xy];
+	float4 gbuffer2 = Normal[xy];
+	float4 gbuffer3 = Emission[xy];
+	SurfaceData data = SurfaceDataFromGBuffer(gbuffer0, gbuffer1, gbuffer2, gbuffer3);
+	float3 viewDir = normalize(vpos-wpos);
+	GI gi = (GI)0;
+	if(specRef) {
+		 gi.specular = SpecularGI[xy];
+	} else { //use sky as fallback
+		float3 rayOrigin = wpos;
+		float3 reflectDir = reflect(-viewDir, data.normalWorld);
+		float3 skyAtten = 1;
+		float3 sky = RenderAtmosphere(_DirLightData[0], rayOrigin, reflectDir * 1e6, 0, skyAtten, false);
+		gi.specular = sky;
+	}
+	if(diffRef){
+		gi.diffuse = DiffuseGI(wpos, viewDir, data.normalWorld);
+		if(secondOrderGI) gi.diffuse *= SECOND_ORDER_GI_MUL;
+		if(useScreenShadow) gi.diffuse *= AO[xy].r;
+	}
+	return LightAccumulation(wpos, vpos, data, gi, xy, useScreenShadow);
+}
+
+[shader("raygeneration")]
+void PrimaryRayLighting()
+{
+    uint2 dispatchIdx = DispatchRaysIndex().xy;
+	uint3 dispatchDim = DispatchRaysDimensions();
+	float2 uv = (dispatchIdx + 0.5) / float2(dispatchDim.x, dispatchDim.y);
+	float depth = Depth[dispatchIdx].r;
+	float3 rayOrigin = _WorldSpaceCameraPos;
+
+	bool isOpaque = Stencil[dispatchIdx].y == 1;
+
+	float3 wpos = PositionFromDepth(uv, depth);
+	float3 irradiance = 0;
+	if(isOpaque)
+		irradiance = CalcIrradiance(dispatchIdx, wpos, rayOrigin, true, true, false, true);
+
+	float3 skyAtten = 1;
+	float3 sky = RenderAtmosphere(_DirLightData[0], rayOrigin, (wpos - rayOrigin), 0, skyAtten, isOpaque);
+	irradiance = irradiance * skyAtten + sky; 
+
+    RenderTarget[dispatchIdx] = float4(irradiance, 1.0);
+}
+
+[shader("raygeneration")]
+void ReflectionRayLighting()
+{
+    uint2 dispatchIdx = DispatchRaysIndex().xy;
+	uint3 dispatchDim = DispatchRaysDimensions();
+	float2 uv = (dispatchIdx + 0.5) / float2(dispatchDim.x, dispatchDim.y);
+	float depth = PrimaryDepth[dispatchIdx].r;
+	float3 rayOrigin = PositionFromDepth(uv, depth);
+
+	bool isOpaque = Position[dispatchIdx].w == 1;
+
+	float3 wpos = Position[dispatchIdx];
+	float3 irradiance = 0;
+	if(isOpaque)
+		irradiance = CalcIrradiance(dispatchIdx, wpos, rayOrigin, false, true, false, false);
+
+	float3 skyAtten = 1;
+	float3 sky = RenderAtmosphere(_DirLightData[0], rayOrigin, (wpos - rayOrigin), 0, skyAtten, isOpaque);
+	irradiance = irradiance * skyAtten + sky; 
+
+    RenderTarget[dispatchIdx] = float4(irradiance, 1.0);
+}
+
+[shader("raygeneration")]
+void GIRayLighting()
+{
+    uint2 dispatchIdx = DispatchRaysIndex().xy;
+	int probeId = dispatchIdx.x;
+
+	float3 rayOrigin = NewProbePositions[probeId];
+
+	bool isOpaque = Position[dispatchIdx].w == 1;
+
+	float3 wpos = Position[dispatchIdx];
+	float3 irradiance = 0;
+	if(isOpaque)
+		irradiance = CalcIrradiance(dispatchIdx, wpos, rayOrigin, false, true, true, false);
+
+	float3 skyAtten = 1;
+	float3 sky = RenderAtmosphere(_DirLightData[0], rayOrigin, (wpos - rayOrigin), 0, skyAtten, isOpaque);
+	irradiance = irradiance * skyAtten + sky; 
+
+    RenderTarget[dispatchIdx] = float4(irradiance, 1.0);
+}
+

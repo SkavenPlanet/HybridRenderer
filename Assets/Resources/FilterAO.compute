@@ -1,0 +1,154 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+#pragma kernel CSMain2
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+#define BLOCK_SIZE 8
+
+RWTexture2D<float4> AOFiltered;
+Texture2D<float4> DepthBuffer;
+Texture2D<float4> AOBuffer;
+
+uniform float AOFilterDepthSigma, AOFilterDistanceSigma;
+uniform float texWidth, texHeight;
+
+static const int c_radius = 5;
+static const int c_paddedPixelWidth = BLOCK_SIZE + c_radius * 2;
+static const int c_paddedPixelCount = c_paddedPixelWidth * c_paddedPixelWidth;
+
+uniform float _BlurFactor;
+uniform float DistKernel0, DistKernel1, DistKernel2, 
+    DistKernel3, DistKernel4, DistKernel5;
+//uniform float distanceKernel[c_radius + 1];
+groupshared float2 s_depthAO[c_paddedPixelWidth][c_paddedPixelWidth];
+
+float FilterAO(int2 paddedPixelPos)
+{
+    if (AOFilterDistanceSigma <= 0.f || AOFilterDepthSigma <= 0.f)
+    {
+        return s_depthAO[paddedPixelPos.x][paddedPixelPos.y].y;
+    }
+
+    float distanceKernel[c_radius + 1];
+    distanceKernel[0] = DistKernel0;
+    distanceKernel[1] = DistKernel1;
+    distanceKernel[2] = DistKernel2;
+    distanceKernel[3] = DistKernel3;
+    distanceKernel[4] = DistKernel4;
+    distanceKernel[5] = DistKernel5;
+
+    float totalWeight = 0.f;
+    float sum = 0.f;
+    float centerDepth = s_depthAO[paddedPixelPos.x][paddedPixelPos.y].x;
+
+    for (int y = -c_radius; y <= c_radius; ++y)
+    {
+        for (int x = -c_radius; x <= c_radius; ++x)
+        {
+            float weight = distanceKernel[abs(x)] * distanceKernel[abs(y)];
+            float depth = s_depthAO[paddedPixelPos.x + x][paddedPixelPos.y + y].x;
+            float depthDifference = depth - centerDepth;
+
+            weight *= exp(-(depthDifference * depthDifference) / (2.f * AOFilterDepthSigma * AOFilterDepthSigma));
+
+            sum += s_depthAO[paddedPixelPos.x + x][paddedPixelPos.y + y].y *weight;
+            totalWeight += weight;
+        }
+    }
+
+    return sum / totalWeight;
+}
+
+[numthreads(BLOCK_SIZE, BLOCK_SIZE, 1)]
+void CSMain (uint3 GroupID : SV_GroupID, uint GroupIndex : SV_GroupIndex, 
+    uint3 GroupThreadID : SV_GroupThreadID, uint3 id : SV_DispatchThreadID)
+{
+
+    // Load depth and AO for this thread group so we can filter it quickly with group shared memory
+    int2 pixelBase = int2(GroupID.xy) * int2(BLOCK_SIZE, BLOCK_SIZE) - int2(c_radius, c_radius);
+    int pixelIndex = int(GroupIndex);
+
+    static const int c_unpaddedPixelCount = BLOCK_SIZE * BLOCK_SIZE;
+    static const int c_loopCount = (c_paddedPixelCount % c_unpaddedPixelCount) ? (1 + c_paddedPixelCount / c_unpaddedPixelCount) : (c_paddedPixelCount / c_unpaddedPixelCount);
+
+    // Loop to fill the shared memory
+    for (int i = 0; i < c_loopCount; ++i)
+    {
+        int2 paddedPixel = int2(pixelIndex % c_paddedPixelWidth, pixelIndex / c_paddedPixelWidth);
+
+        if (paddedPixel.x < c_paddedPixelWidth && paddedPixel.y < c_paddedPixelWidth)
+        {
+            int2 srcPixel = paddedPixel + pixelBase;
+
+            if (srcPixel.x < 0 || srcPixel.y < 0 || srcPixel.x >= texWidth || srcPixel.y >= texHeight)
+            {
+                s_depthAO[paddedPixel.x][paddedPixel.y] = float2(0.f, 0.f);
+            }
+            else
+            {
+                float depth = DepthBuffer[srcPixel].r;
+                float AO = AOBuffer[srcPixel].r;
+                s_depthAO[paddedPixel.x][paddedPixel.y] = float2(depth, AO);
+            }
+        }
+
+        // Move to the next pixel
+        pixelIndex += (BLOCK_SIZE * BLOCK_SIZE);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // Filter using group shared memory
+    int2 globalPixelIndex = int2(id.xy);
+    int2 localPixelIndex = int2(GroupThreadID.xy) + int2(c_radius, c_radius);
+
+    AOFiltered[globalPixelIndex] = FilterAO(localPixelIndex);
+
+}
+
+Texture2D<float4> RefSrcMip;
+RWTexture2D<float4> RefDstMip;
+SamplerState linearClampSampler;
+uniform int _Mip;
+uniform float2 _Dir;
+//uniform float Kernel[4];
+
+inline float pow2 (float x) {
+    return x * x;
+}
+
+float gaussian(float2 i, float sigma) {
+    return 1.0 / (2.0 * 3.1415926535 * pow2(sigma)) * exp(-((pow2(i.x) + pow2(i.y)) / (2.0 * pow2(sigma))));
+}
+
+
+[numthreads(BLOCK_SIZE, BLOCK_SIZE, 1)]
+void CSMain2(uint3 id : SV_DispatchThreadID)
+{
+    int2 xy = id.xy;
+    int mipSize = (1 << _Mip);
+
+    float4 sum = 0;
+    int s = 8 * _BlurFactor;
+    float sigma = s * 0.5;
+    float2 uv = xy / float2(texWidth, texHeight);
+    //float depth = DepthBuffer.SampleLevel(linearClampSampler, uv, 0).r;
+    for (int x = -s; x < s; x++) {
+        for (int y = -s; y < s; y++) {
+            float2 offset = float2(x, y);
+            float weight = gaussian(offset, sigma);
+            float2 sampleUV = uv + offset / float2(texWidth * 2, texHeight * 2);
+            float3 samp = RefSrcMip.SampleLevel(linearClampSampler, sampleUV, 0).rgb;
+            //float sampDepth = DepthBuffer.SampleLevel(linearClampSampler, sampleUV, 0).r;
+            //float depthDiff = abs(depth - sampDepth);
+            //weight *= exp(-(depthDiff * depthDiff) / (2.f * 1000));
+            //if (abs(depth - sampDepth) > 0.0001) continue;
+            sum += float4(samp, 1.0) * weight;
+        }
+    }
+    //sum += float4(RefSrcMip.SampleLevel(linearClampSampler, uv, 0).rgb, 1.0);
+    sum.a = max(0.000001, sum.a);
+    RefDstMip[xy] = float4(sum.rgb / sum.a, 1.0);
+
+}

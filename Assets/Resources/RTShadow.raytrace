@@ -1,0 +1,119 @@
+#include "HLSLSupport.cginc"
+#include "UnityRaytracingMeshUtils.cginc"
+#include "UnityShaderVariables.cginc"
+#include "Assets/Shaders/PositionFromDepth.cginc"
+#include "Assets/Shaders/RTInclude.cginc"
+#include "Assets/Shaders/Lighting.cginc"
+
+#pragma max_recursion_depth 1
+
+RaytracingAccelerationStructure accelerationStructure : register(t0);
+
+Texture2D<float4> PrimaryDepth;
+Texture2D<float4> PrimaryNormal;
+Texture2D<uint2> Stencil;
+
+RWTexture2D<float4> RenderTarget;
+Texture2D<float4> BlueNoise;
+
+[shader("raygeneration")]
+void DirectionalShadow()
+{
+    uint2 dispatchIdx = DispatchRaysIndex().xy;
+	uint3 dispatchDim = DispatchRaysDimensions();
+
+	float2 uv = (dispatchIdx.xy + 0.5) / float2(dispatchDim.x, dispatchDim.y);
+	float depth = PrimaryDepth[dispatchIdx].r;
+	float3 rayOrigin = PositionFromDepth(uv, depth);
+
+	bool isOpaque = Stencil[dispatchIdx].y == 1;
+	if(!isOpaque) {
+		RenderTarget[dispatchIdx] = float4(1, 0, 0, 0);
+		return;
+	}
+
+	float3 lightDir = _DirLightData[0].direction;
+
+	float3 normal = normalize(PrimaryNormal[dispatchIdx].xyz * 2 - 1);
+
+	float2 rng = BlueNoise[dispatchIdx.xy%256].rg;
+	float pointRadius = 0.01 * sqrt(rng.x);
+	float pointAngle = rng.y * 2.0f * 3.1414526535;
+	float2 diskPoint = float2(pointRadius*cos(pointAngle), pointRadius*sin(pointAngle));
+
+	//will break if lightdir is 0,1,0
+	float3 lightTangent = normalize(cross(lightDir, float3(0, 1, 0)));
+	float3 lightBitangent = normalize(cross(lightTangent, lightDir));
+
+	float3 shadowRayDir = normalize(lightDir + diskPoint.x * lightTangent + diskPoint.y * lightBitangent);
+
+	RayDesc ray;
+	ray.Origin = rayOrigin + normal * 0.1; 
+	ray.Direction = shadowRayDir; 
+	ray.TMin = 0;
+	ray.TMax = 10000;
+
+	ShadowPayload payload;
+	payload.atten = 1;
+	TraceRay(accelerationStructure, 0, 0xFFFFFFF, 0, 1, 0, ray, payload);
+   
+    RenderTarget[dispatchIdx] = float4(payload.atten, 0, 0, 0);
+}
+
+float TraceAORay (float2 idx, float3 wpos, float3 normal) {
+
+	static const float numAngles = 10;
+
+	float blueNoiseValue = BlueNoise[idx%256].r;
+	float3 blueNoiseDir = sphericalFibonacci(clamp(blueNoiseValue * numAngles, 0, numAngles-1), numAngles);
+	float3 rayDirection = normalize(normal + blueNoiseDir);
+
+	float aoRadius = 2;
+
+	RayDesc ray;
+	ray.Origin = wpos.xyz;
+	ray.Direction = rayDirection; 
+	ray.TMin = 0.0001;
+	ray.TMax = aoRadius;
+
+	ShadowPayload payload;
+	payload.atten = 1;
+	payload.hitT = -1;
+	TraceRay(accelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xFFFFFFF, 0, 1, 0, ray, payload);
+
+	return (payload.hitT < 0) ? 1 : pow(clamp(payload.hitT / aoRadius, 0, 1), 0.5);
+
+}
+
+[shader("raygeneration")]
+void AmbientOcclusion()
+{
+    uint2 dispatchIdx = DispatchRaysIndex().xy;
+	uint3 dispatchDim = DispatchRaysDimensions();
+
+	float2 uv = (dispatchIdx.xy + 0.5) / float2(dispatchDim.x, dispatchDim.y);
+	float depth = PrimaryDepth[dispatchIdx].r;
+	float3 rayOrigin = PositionFromDepth(uv, depth);
+
+	bool isOpaque = Stencil[dispatchIdx].y == 1;
+	if(!isOpaque) {
+		RenderTarget[dispatchIdx] = float4(1, 0, 0, 0);
+		return;
+	}
+
+	float3 normal = normalize(PrimaryNormal[dispatchIdx].xyz * 2 - 1);
+
+	//launch two rays and average
+	float AOSample0 = TraceAORay((int2)dispatchIdx, rayOrigin, normal);
+	float AOSample1 = TraceAORay((int2)dispatchIdx + int2(89, 73), rayOrigin, normal);
+	float AO = (AOSample0 + AOSample1) / 2;
+   
+    RenderTarget[dispatchIdx] = float4(AO, 0, 0, 0);
+}
+
+[shader("miss")]
+void MyMissShader(inout ShadowPayload payload : SV_RayPayload)
+{
+    payload.atten = 1;
+}
+

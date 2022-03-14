@@ -1,0 +1,90 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel HorzBlurCs
+#pragma kernel VertBlurCs
+
+#define maxRadius 92 // cant be larger then N/2
+
+#define threadCount 64
+
+Texture2D<float4> source;
+RWTexture2D<float4> horBlurOutput;
+RWTexture2D<float4> verBlurOutput;
+StructuredBuffer<float> gWeights;
+uniform int blurRadius;
+
+#define CacheSize (threadCount + 2*maxRadius)
+groupshared float4 gCache[CacheSize];
+
+[numthreads(threadCount, 1, 1)]
+void HorzBlurCs(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupThreadID : SV_GroupThreadID)
+{
+  int clampedDistX = min(dispatchThreadId.x, source.Length.x - 1);
+  int clampedDistY = min(dispatchThreadId.y, source.Length.y - 1);
+  uint bRadius = (uint) blurRadius;
+
+  if (groupThreadID.x < bRadius)
+  {
+    int x = max(clampedDistX - blurRadius, 0);
+    uint2 clampedPos = uint2(x, clampedDistY);
+    gCache[groupThreadID.x] = source[clampedPos];
+
+  }
+  else if (groupThreadID.x >= threadCount - bRadius) // 2 zakres
+  {
+    int x = min(clampedDistX + blurRadius, source.Length.x - 1);
+    uint2 clampedPos = uint2(x, clampedDistY);
+    gCache[groupThreadID.x + 2 * blurRadius] = source[clampedPos];
+
+  }
+
+  uint2 clampedPos = uint2(clampedDistX, clampedDistY);
+  gCache[groupThreadID.x + blurRadius] = source[clampedPos];
+
+  GroupMemoryBarrierWithGroupSync();
+  float4 blurColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+  [unroll(2 * maxRadius)]
+  for (int i = -blurRadius; i <= blurRadius; i++)
+  {
+    int k = groupThreadID.x + blurRadius + i;
+    blurColor += gCache[k] * gWeights[i + blurRadius];
+
+  }
+  horBlurOutput[uint2(dispatchThreadId.x, dispatchThreadId.y)] = blurColor;
+
+}
+
+[numthreads(1, threadCount, 1)]
+void VertBlurCs(uint3 groupThreadID : SV_GroupThreadID, uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+  int clampedDistX = min(max(dispatchThreadId.x, 0), horBlurOutput.Length.x - 1);
+  int clampedDistY = min(max(dispatchThreadId.y, 0), horBlurOutput.Length.y - 1);
+  uint bRadius = (uint) blurRadius;
+  if (groupThreadID.y < bRadius)
+  {
+    int y = max(clampedDistY - blurRadius, 0);
+    uint2 clampedPos = uint2(clampedDistX, y);
+    gCache[groupThreadID.y] = horBlurOutput[clampedPos];
+  }
+  else if (groupThreadID.y >= threadCount - bRadius)
+  {
+    int y = min(clampedDistY + blurRadius, horBlurOutput.Length.y - 1);
+    uint2 clampedPos = uint2(clampedDistX, y);
+    gCache[groupThreadID.y + 2 * blurRadius] = horBlurOutput[clampedPos];
+
+  }
+
+  uint2 clampedPos = uint2(clampedDistX, clampedDistY);
+  gCache[groupThreadID.y + blurRadius] = horBlurOutput[clampedPos];
+
+  GroupMemoryBarrierWithGroupSync();
+  float4 blurColor = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+  [unroll(2 * maxRadius)]
+  for (int i = -blurRadius; i <= blurRadius; i++)
+  {
+    int k = groupThreadID.y + blurRadius + i;
+    blurColor += gCache[k] * gWeights[i + blurRadius];
+  }
+  verBlurOutput[uint2(dispatchThreadId.x, dispatchThreadId.y)] = blurColor;
+}

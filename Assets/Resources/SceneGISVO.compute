@@ -1,0 +1,147 @@
+#pragma kernel Clear
+
+#pragma kernel GenChildNodes
+
+#pragma kernel CollectChildNodes
+
+#pragma kernel CollectChildNodesArgs
+
+#pragma kernel GenChildNodesArgs
+
+#pragma kernel SetProbeIndices
+
+#pragma kernel SVOCopy
+
+struct SceneNode {
+	float3 center;
+	int isLeaf;
+	int depth;
+	int parent;
+	int octant;
+	int childIsProbe;
+	int indices[8];
+};
+
+struct NodeProbeIndices {
+	int nodeIdx;
+	int probeIndices[8];
+};
+
+RWTexture3D<float4> VoxelFragments;
+
+uniform int _Depth;
+uniform int _ReachedMaxDepth;
+uniform float _NodeSize;
+uniform float3 _CameraPos;
+RWStructuredBuffer<SceneNode> SVO;
+RWStructuredBuffer<SceneNode> FINAL_SVO;
+AppendStructuredBuffer<SceneNode> TempNodes_Append;
+AppendStructuredBuffer<int> LeafNodeIndices;
+AppendStructuredBuffer<SceneNode> LeafNodes;
+RWStructuredBuffer<SceneNode> TempNodes;
+RWStructuredBuffer<int> COUNT;
+RWStructuredBuffer<uint> ARGS;
+StructuredBuffer<NodeProbeIndices> LeafProbeIndices;
+
+//simple clear
+[numthreads(8, 8, 8)]
+void Clear(uint3 id : SV_DispatchThreadID)
+{
+	VoxelFragments[id] = 0;
+}
+
+[numthreads(64, 1, 1)]
+void GenChildNodes(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= ARGS[0]) return;
+	int nodeIdx = id.x + COUNT[0];
+	SceneNode node = SVO[nodeIdx];
+	if (node.isLeaf) return;
+
+	for (uint i = 0; i < 8; i++) {
+		float3 offset = float3(i % 2, i / 4, (i / 2) % 2)-0.5;
+		SceneNode child = (SceneNode)0;
+		child.center = node.center + offset * _NodeSize;
+		child.depth = _Depth;
+		child.parent = nodeIdx;
+		child.octant = i;
+		TempNodes_Append.Append(child);
+	}
+}
+
+[numthreads(64, 1, 1)]
+void CollectChildNodes(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= ARGS[1]) return;
+	int nodeIdx = id.x;
+	SceneNode tempNode = TempNodes[nodeIdx];
+	SceneNode parentNode = SVO[tempNode.parent];
+
+	int3 offset = (int3)floor(tempNode.center - _NodeSize/2 + 256);
+	uint numVoxels = 512 >> tempNode.depth;
+	bool noContent = true;
+
+	if (numVoxels <= 32) {
+		for (uint i = 0; i < numVoxels * numVoxels * numVoxels; i++)
+		{
+			int x = i % numVoxels;
+			int y = (i / numVoxels) % numVoxels;
+			int z = i / (numVoxels * numVoxels);
+			if (VoxelFragments[int3(x, y, z) + offset].r) {
+				noContent = false;
+				break;
+			}
+		}
+	}
+	else {
+		noContent = false;
+	}
+
+	if (!noContent) {
+		tempNode.isLeaf = _ReachedMaxDepth || (_Depth > 6 && length(tempNode.center - _CameraPos) > 32);
+		uint newIdx = SVO.IncrementCounter();
+		if (tempNode.isLeaf) {
+			tempNode.indices[0] = newIdx;
+			LeafNodes.Append(tempNode);
+		}
+		SVO[newIdx] = tempNode;
+		SVO[tempNode.parent].indices[tempNode.octant] = newIdx;
+	}
+	else {
+		SVO[tempNode.parent].indices[tempNode.octant] = -1;
+	}
+}
+
+[numthreads(1, 1, 1)]
+void CollectChildNodesArgs(uint3 id : SV_DispatchThreadID)
+{
+	int numTempNodes = ARGS[1];
+	ARGS[6] = (uint)ceil(max(0, numTempNodes / 64.0f));
+}
+
+[numthreads(1, 1, 1)]
+void GenChildNodesArgs(uint3 id : SV_DispatchThreadID)
+{
+	int numNodesAtDepth = ARGS[2] - (COUNT[0] + ARGS[0]);
+	int numNodesAtLastDepth = ARGS[0];
+	COUNT[0] += numNodesAtLastDepth;
+	ARGS[0] = numNodesAtDepth;
+	ARGS[1] = 0;
+	ARGS[2] = 0;
+	ARGS[3] = (uint)ceil(max(0, numNodesAtDepth / 64.0f));
+}
+
+[numthreads(64, 1, 1)]
+void SetProbeIndices(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= ARGS[1]) return;
+	NodeProbeIndices data = LeafProbeIndices[id.x];
+	SVO[data.nodeIdx].indices = data.probeIndices;
+}
+
+[numthreads(64, 1, 1)]
+void SVOCopy(uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= ARGS[0]) return;
+	FINAL_SVO[id.x] = SVO[id.x];
+}

@@ -1,0 +1,206 @@
+#include "HLSLSupport.cginc"
+#include "UnityRaytracingMeshUtils.cginc"
+#include "UnityShaderVariables.cginc"
+#include "Assets/Shaders/PositionFromDepth.cginc"
+#include "Assets/Shaders/RTInclude.cginc"
+#include "Assets/Shaders/Lighting.cginc"
+#include "Assets/Shaders/Sky.cginc"
+
+float4x4 RandomOrientation;
+int _NumRaysPerProbe, _Offset, _NumProbes;
+
+#pragma max_recursion_depth 10
+
+RaytracingAccelerationStructure accelerationStructure : register(t0);
+
+Texture2D<float4> PrimaryDepth;
+Texture2D<float4> PrimaryNormal;
+Texture2D<uint2> Stencil;
+
+RWTexture2D<float4> IrradianceOutput;
+RWTexture2D<float4> Albedo;
+RWTexture2D<float4> Normal;
+RWTexture2D<float4> Position;
+RWTexture2D<float4> Emission;
+RWTexture2D<float4> RoughSpec;
+
+//https://media.contentapi.ea.com/content/dam/ea/seed/presentations/2019-ray-tracing-gems-chapter-20-akenine-moller-et-al.pdf
+
+[shader("raygeneration")]
+void ReflectionGBuffer()
+{
+    uint2 dispatchIdx = DispatchRaysIndex().xy;
+	uint3 dispatchDim = DispatchRaysDimensions();
+
+	float2 uv = (dispatchIdx.xy + 0.5) / float2(dispatchDim.x, dispatchDim.y);
+	float depth = PrimaryDepth[dispatchIdx].r;
+	float3 rayOrigin = PositionFromDepth(uv, depth);
+
+	float3 normal = normalize(PrimaryNormal[dispatchIdx].xyz * 2 - 1);
+
+	float3 viewDir = normalize(rayOrigin - _WorldSpaceCameraPos);
+	float3 reflectDir = reflect(viewDir, normal);
+
+	RayDesc ray;
+	ray.Origin = rayOrigin + reflectDir * 0.001; 
+	ray.Direction = reflectDir; 
+	ray.TMin = 0;
+	ray.TMax = 100000;
+
+	GBufferPayload payload = (GBufferPayload)0;
+	payload.hit = false;
+	payload.position = reflectDir * 1e6;
+
+	RayCone startCone = computeRayConeFromGBuffer(length(rayOrigin - _WorldSpaceCameraPos));
+	payload.cone = startCone;
+
+	bool isOpaque = Stencil[dispatchIdx].y == 1;
+	if(isOpaque) {
+		TraceRay(accelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 
+		0xFFFFFFF, 0, 1, 0, ray, payload);
+	}
+
+    Albedo[dispatchIdx] = payload.gBuffer0;
+	RoughSpec[dispatchIdx] = payload.gBuffer1;
+	Normal[dispatchIdx] = payload.gBuffer2;
+	Emission[dispatchIdx] = payload.gBuffer3;
+	Position[dispatchIdx] = float4(payload.position, payload.hit ? 1 : 0);
+}
+
+[shader("raygeneration")]
+void GIGBuffer()
+{
+    uint2 dispatchIdx = DispatchRaysIndex().xy;
+	uint3 dispatchDim = DispatchRaysDimensions();
+	
+	int probeId = dispatchIdx.x;
+	int rayId = dispatchIdx.y;
+	float3 probePos = NewProbePositions[probeId];
+
+	float3 wpos = probePos;
+
+	float3 rayDir = normalize(sphericalFibonacci(rayId, _NumRaysPerProbe));
+
+	RayDesc ray;
+	ray.Origin = wpos + rayDir * 0.01; 
+	ray.Direction = rayDir; 
+	ray.TMin = 0;
+	ray.TMax = 10000;
+
+	GBufferPayload payload = (GBufferPayload)0;
+	payload.hit = false;
+	payload.position = rayDir * 1e6;
+	TraceRay(accelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xFFFFFFF, 0, 1, 0, ray, payload);
+
+	float backface = payload.hitKind == HIT_KIND_TRIANGLE_BACK_FACE ? 1 : -1;
+	payload.gBuffer2.a = backface;
+
+    Albedo[dispatchIdx] = payload.gBuffer0;
+	RoughSpec[dispatchIdx] = payload.gBuffer1;
+	Normal[dispatchIdx] = payload.gBuffer2;
+	Emission[dispatchIdx] = payload.gBuffer3;
+	Position[dispatchIdx] = float4(payload.position, payload.hit ? 1 : 0);
+}
+
+/*
+[shader("raygeneration")]
+void RefractionLighting()
+{
+    uint2 dispatchIdx = DispatchRaysIndex().xy;
+	uint3 dispatchDim = DispatchRaysDimensions();
+
+	float2 texcoord = (dispatchIdx.xy + float2(0.5, 0.5)) / float2(dispatchDim.x, dispatchDim.y);
+	float depth = PrimaryDepth[dispatchIdx].r;
+	float4 positionCS = float4(texcoord * 2.0 - 1.0, depth, 1.0);
+	float4 wpos = mul(UNITY_MATRIX_I_VP, positionCS);
+	wpos.xyz /= wpos.w;
+
+	//if(depth < 0.0001) return;
+
+	//float3 lightDir = _DirLights[0].direction;
+
+	//float3 normal = normalize(NormalBuffer[dispatchIdx].xyz * 2 - 1);
+
+	float3 viewDir = normalize(wpos.xyz - _WorldSpaceCameraPos);
+	//float3 reflectDir = reflect(viewDir, normal);
+
+	float distToOpaque = length(wpos.xyz - _WorldSpaceCameraPos);
+
+	RayDesc ray;
+	ray.Origin = _WorldSpaceCameraPos;// + reflectDir * 0.001; 
+	ray.Direction = viewDir;//reflectDir; 
+	ray.TMin = 0;
+	ray.TMax = distToOpaque;
+
+	LightingPayload payload;
+	payload.light = 0;
+	payload.atten = 1;
+	payload.bounceIndex = 0;
+	payload.dist = distToOpaque;
+	payload.kr = 1;
+	payload.refracted = Irradiance[dispatchIdx].xyz;
+
+	//RayCone startCone = computeRayConeFromGBuffer(length(wpos.xyz - _WorldSpaceCameraPos));
+	//payload.cone = startCone;
+
+	//if(depth > 0.00001) {
+		TraceRay(accelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES | RAY_FLAG_FORCE_OPAQUE, 
+			0xF0, 0, 1, 0, ray, payload);
+		//payload.albedo = reflectDir;
+	//}
+
+	Irradiance[dispatchIdx] = float4(payload.light, 1.0);
+}
+*/
+
+//second order reflection
+/*
+[shader("raygeneration")]
+void ReflectionGBuffer2()
+{
+    uint2 dispatchIdx = DispatchRaysIndex().xy;
+	uint3 dispatchDim = DispatchRaysDimensions();
+
+	float2 texcoord = (dispatchIdx.xy + float2(0.5, 0.5)) / float2(dispatchDim.x, dispatchDim.y);
+	int2 srcId = dispatchIdx.xy * 2;
+	float3 wpos = PositionBuffer[srcId].xyz;
+
+	//if(depth < 0.0001) return;
+
+	//float3 lightDir = _DirLights[0].direction;
+
+	float3 normal = normalize(NormalBuffer[srcId].xyz * 2 - 1);
+
+	float3 viewDir = RaysBuffer[srcId].xyz;
+	float3 reflectDir = reflect(viewDir, normal);
+
+	RayDesc ray;
+	ray.Origin = wpos.xyz + reflectDir * 0.001; 
+	ray.Direction = reflectDir; 
+	ray.TMin = 0;
+	ray.TMax = 20000;
+
+	GBufferPayload payload;
+	payload.hit = false;
+	payload.albedo = 0;
+	payload.specularColor = 0;
+	payload.normal = -1;
+	payload.position = 0;
+
+	RayCone startCone = computeRayConeFromGBuffer(length(wpos.xyz - _WorldSpaceCameraPos));
+	payload.cone = startCone;
+
+	//if(normal.x > 0) {
+		TraceRay(accelerationStructure, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 
+		0xFFFFFFF, 0, 1, 0, ray, payload);
+		//payload.albedo = reflectDir;
+	//}
+
+	RefRays[dispatchIdx] = float4(reflectDir, payload.hit ? 1 : 0);
+    RefAlbedo[dispatchIdx] = float4(payload.albedo, payload.hit ? 1 : 0);
+	RefNormal[dispatchIdx] = float4(payload.normal * 0.5 + 0.5, 0);
+	RefRoughSpec[dispatchIdx] = float4(payload.specularColor, payload.smoothness);
+	RefEmission[dispatchIdx] = float4(payload.emission, 0);
+	RefPosition[dispatchIdx] = float4(payload.position, 0);
+}
+*/

@@ -1,0 +1,225 @@
+#pragma kernel GenTempChildNodes
+
+#pragma kernel CullLights
+
+#pragma kernel CollectChildNodes
+
+#pragma kernel CullLightsArgs
+
+#pragma kernel GenChildNodesArgs
+
+#include "Assets/Shaders/Lighting.cginc"
+
+#define BITMASK_SIZE (MAX_LIGHTS_PER_NODE/32)
+
+struct LightCullList {
+	int indices[BITMASK_SIZE];
+};
+
+uniform int _Depth;
+uniform int _ReachedMaxDepth;
+uniform float _NodeSize, _BoundingSphereRadius;
+RWStructuredBuffer<LightNode> SVO;
+AppendStructuredBuffer<LightNode> TempNodes_Append;
+RWStructuredBuffer<LightNode> TempNodes;
+RWStructuredBuffer<int> MAX_LIGHTS_AT_DEPTH;
+RWStructuredBuffer<LightCullList> LightCullBitmask;
+RWStructuredBuffer<int> LightCullListData;
+RWStructuredBuffer<uint> LightList;
+RWStructuredBuffer<int> COUNT;
+RWStructuredBuffer<uint> ARGS;
+
+//https://simoncoenen.com/blog/programming/graphics/SpotlightCulling
+bool CullSpotLight(float3 bmin, float3 bmax, Light light, out bool insideLight) {
+	float3 extents = _NodeSize * 0.5;
+	float3 center = bmin + extents;
+	float sphereRadius = _BoundingSphereRadius;
+	float3 v = center - light.position;
+	float lenSq = dot(v, v);
+	float v1Len = dot(v, -light.direction);
+	float distanceClosestPoint = cos(light.spotAngle) * sqrt(lenSq - v1Len * v1Len) - v1Len * sin(light.spotAngle);
+	bool frontCull = v1Len > sphereRadius + light.range;
+	bool backCull = v1Len < -sphereRadius;
+	insideLight = false;
+	if (frontCull || backCull) return false;
+	if (distanceClosestPoint >= sphereRadius)
+	{
+		return false;
+	}
+	else if (distanceClosestPoint <= -sphereRadius)
+	{
+		insideLight = true;
+		return true;
+	}
+	return true;
+}
+
+bool CullPointLight(float3 bmin, float3 bmax, Light light, out bool insideLight)
+{
+    float dmin = 0, dmax = 0;
+    float r2 = light.range * light.range;
+    for (int i = 0; i < 3; i++)
+    {
+        float a = Pow2(light.position[i] - bmin[i]);
+        float b = Pow2(light.position[i] - bmax[i]);
+        dmax += max(a, b);
+        if (light.position[i] < bmin[i])
+        {
+			dmin += a;
+        }
+        else if (light.position[i] > bmax[i])
+        {
+			dmin += b;
+        }
+    }
+	insideLight = (dmax <= r2 && dmin <= r2);
+    return (dmin <= r2);
+}
+
+bool CullLight(float3 bmin, float3 bmax, Light light, out bool insideLight) {
+	switch (light.lightType) {
+		case POINT:
+			return CullPointLight(bmin, bmax, light, insideLight);
+		case SPOT:
+			return CullSpotLight(bmin, bmax, light, insideLight);
+	}
+	insideLight = false;
+	return false;
+}
+
+[numthreads(64, 1, 1)]
+void GenTempChildNodes (uint3 id : SV_DispatchThreadID)
+{
+	if (id.x >= ARGS[0]) return;
+	int nodeIdx = id.x + COUNT[0];
+	LightNode node = SVO[nodeIdx];
+	if NODE_IS_LEAF(node) return;
+
+	InterlockedMax(MAX_LIGHTS_AT_DEPTH[0], node.numLights);
+	for (uint i = 0; i < 8; i++) {
+		float3 offset = float3(i % 2, i / 4, (i / 2) % 2);
+		LightNode child = (LightNode)0;
+		child.min = node.min + offset * _NodeSize;
+		NODE_SET_PARENT(child, nodeIdx);
+		NODE_SET_OCTANT(child, i);
+		NODE_SET_DEPTH(child, _Depth);
+		TempNodes_Append.Append(child);
+	}
+}
+
+uint GetLightIdx2(uint lightOffset, uint idx) {
+	uint data = LightList[lightOffset + (idx >> 1)];
+	return (idx & 1) ? data >> 16 : (data & 0x0000FFFF);
+}
+
+//cull lights in parallel
+[numthreads(64, 1, 1)]
+void CullLights(uint3 id : SV_DispatchThreadID)
+{
+	uint maxLightsAtDepth = (uint)MAX_LIGHTS_AT_DEPTH[0];
+	int nodeIdx = id.x / maxLightsAtDepth;
+	if (nodeIdx >= ARGS[1]) return;
+
+	int idx = id.x % maxLightsAtDepth;
+
+	LightNode tempNode = TempNodes[nodeIdx];
+	uint parentIdx = NODE_PARENT(tempNode);
+	LightNode parentNode = SVO[parentIdx];
+
+	if (idx >= parentNode.numLights) return;
+
+	uint lightIdx = GetLightIdx2((uint)parentNode.lightOffset, idx);
+	Light light = _LightData[lightIdx];
+
+	bool insideLight;
+	if (CullLight(tempNode.min, tempNode.min + _NodeSize, light, insideLight))
+	{
+		LightCullListData[nodeIdx * maxLightsAtDepth + idx] =
+			lightIdx + (insideLight ? MAX_LIGHTS_PER_NODE : 0);
+	}
+	else {
+		LightCullListData[nodeIdx * maxLightsAtDepth + idx] = -1;
+	}
+}
+
+[numthreads(64, 1, 1)]
+void CollectChildNodes(uint3 id : SV_DispatchThreadID)
+{
+	uint maxLightsAtDepth = (uint)MAX_LIGHTS_AT_DEPTH[0];
+	int nodeIdx = id.x;
+	if (nodeIdx >= ARGS[1]) return;
+
+	LightNode tempNode = TempNodes[nodeIdx];
+	uint parentIdx = NODE_PARENT(tempNode);
+	uint octant = NODE_OCTANT(tempNode);
+
+	LightNode parentNode = SVO[parentIdx];
+
+	bool allInside = true;
+	for (uint i = 0; i < parentNode.numLights; i++) {
+		int val = LightCullListData[nodeIdx * maxLightsAtDepth + i];
+		if (val >= 0) {
+			tempNode.numLights++;
+			if (val < MAX_LIGHTS_PER_NODE) {
+				allInside = false;
+			}
+		}
+	}
+
+	//no lights, don't add node to svo
+	if (tempNode.numLights == 0) { 
+		SVO[parentIdx].indices[octant] = -1;
+	}
+	else {
+		if (tempNode.numLights == parentNode.numLights) {
+			tempNode.lightOffset = parentNode.lightOffset;
+		}
+		else {
+			uint offset;
+			uint lightListSize = (uint)((tempNode.numLights >> 1) + (tempNode.numLights & 1));
+			InterlockedAdd(LightList[0], lightListSize, offset);
+			tempNode.lightOffset = (int)offset;
+
+			uint count = 0;
+			for (uint i = 0; i < parentNode.numLights; i++) {
+				int val = LightCullListData[nodeIdx * maxLightsAtDepth + i];
+				if (val >= 0) {
+					uint decodedVal = (uint)(val - (val >= MAX_LIGHTS_PER_NODE ? MAX_LIGHTS_PER_NODE : 0));
+					if ((count & 1) == 0) {
+						LightList[offset + (count>>1)] = 0;
+					}
+					else {
+						decodedVal = decodedVal << 16;
+					}
+					LightList[offset + (count>>1)] |= decodedVal;
+					count++;
+				}
+			}
+		}
+		NODE_SET_IS_LEAF(tempNode, (_ReachedMaxDepth || tempNode.numLights == 0 || allInside));
+		uint newIdx = SVO.IncrementCounter();
+		SVO[newIdx] = tempNode;
+		SVO[parentIdx].indices[octant] = newIdx;
+	}
+}
+
+[numthreads(1, 1, 1)]
+void CullLightsArgs(uint3 id : SV_DispatchThreadID)
+{
+	int numTempNodes = ARGS[1];
+	ARGS[3] = (uint)ceil(max(0, numTempNodes * MAX_LIGHTS_AT_DEPTH[0] / 64.0f));
+	ARGS[6] = (uint)ceil(max(0, numTempNodes / 64.0f));
+}
+
+[numthreads(1, 1, 1)]
+void GenChildNodesArgs(uint3 id : SV_DispatchThreadID)
+{
+	int numNodesAtDepth = ARGS[2]-(COUNT[0]+ARGS[0]);
+	int numNodesAtLastDepth = ARGS[0];
+	COUNT[0] += numNodesAtLastDepth;
+	ARGS[0] = numNodesAtDepth;
+	ARGS[1] = 0;
+	ARGS[2] = 0;
+	ARGS[3] = (uint)ceil(max(0, numNodesAtDepth / 64.0f));
+}
+
