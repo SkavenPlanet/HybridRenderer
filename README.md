@@ -1,8 +1,11 @@
 # HybridRenderer
 
 Hybrid Deferred Rendering Pipeline built using Unity's SRP feature.
+<br />
 Video Link: https://www.youtube.com/watch?v=TXqKqrPcdZQ
-
+<br />
+WARNING: Project may only be compatible with Unity version: 2022.1.0a7
+<br />
 Features:
 - Realtime Raytraced Mirror Specular & Diffuse GI (DDGI)
 - Raytraced Shadows
