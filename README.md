@@ -4,8 +4,6 @@ Hybrid Deferred Rendering Pipeline built using Unity's SRP feature.
 <br />
 Video Link: https://www.youtube.com/watch?v=TXqKqrPcdZQ
 <br />
-**Project may only be compatible with Unity version: 2022.1.0a7**
-<br />
 Features:
 - Realtime Raytraced Mirror Specular & Diffuse GI (DDGI)
 - Raytraced Shadows
@@ -25,7 +23,10 @@ Resources:
 - DDGI Algorithm: https://morgan3d.github.io/articles/2019-04-01-ddgi/
 - Precomputed Atmospheric Scattering: https://hal.inria.fr/inria-00288758/document
 - Car Model is From Here: https://sketchfab.com/3d-models/2021-lamborghini-countach-lpi-800-4-d76b94884432422b966d1a7f8815afb5
-
+<br />
+**Project may only be compatible with Unity version: 2022.1.0a7**
+<br />
+Screenshots:
 <img width="1112" alt="Screen2" src="https://user-images.githubusercontent.com/7034703/158116921-f1f879a4-56ae-4c78-bdbf-81ea95d6d495.PNG">
 <img width="1111" alt="Screen1" src="https://user-images.githubusercontent.com/7034703/158116928-4a96785f-a9da-421a-8c5e-f528cedfec74.PNG">
 <img width="1114" alt="Screen3" src="https://user-images.githubusercontent.com/7034703/158116931-c8b1d321-198a-48b7-9462-7e0afe6255af.PNG">
