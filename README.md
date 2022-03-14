@@ -12,7 +12,8 @@ Features:
 - Sky Rendering (Precomputed Atmospheric Scattering)
 - Unified Deferred Lighting Path
 
-Info:
+Code Info:
+- Rendering pipeline code located in "RP/Runtime"
 - All raytracing and compute shaders are located in the "Resources" folder.
 - "Shaders/Lighting.cginc" contains light loop
 - "Shaders/Standard.shader" is gbuffer shader (raster + raytraced)
