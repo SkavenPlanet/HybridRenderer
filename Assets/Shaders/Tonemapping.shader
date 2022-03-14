@@ -20,16 +20,6 @@ Shader "Hidden/Tonemapping"
 			return 1.0 / maxLuminance;
 		}
 
-		float3 ApplyTonemapping(float3 x)
-		{
-			float a = 2.51f;
-			float b = 0.03f;
-			float c = 2.43f;
-			float d = 0.59f;
-			float e = 0.14f;
-			return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
-		}
-
 		static const float3x3 ACESInputMat =
 		{
 			{0.59719, 0.35458, 0.04823},
@@ -84,12 +74,7 @@ Shader "Hidden/Tonemapping"
 				float3 final = tex2D(_Frame, i.uv).rgb;
 				float currentEV = EV100(16, 0.01, 100);
 				float exposure = EV100ToExposure(currentEV);
-				final *= exposure;
-				//if(i.uv.x > 1.0/3 && i.uv.x < 2.0/3)
-				//	final = ApplyTonemapping(final);
-				//if (i.uv.x >= 2.0 / 3)
-				final = ACESFitted(final);
-				//if(uv.x < 0.5)
+				final = ACESFitted(final * exposure);
 				return float4(final, 1.0);
 			}
 			ENDCG
